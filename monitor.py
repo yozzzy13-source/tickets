@@ -101,12 +101,18 @@ SESSION_BOUNDARY_RE = re.compile(
 RANGE_RE = re.compile(
     r"(\d{1,2})\s*oct\w*\.?\s*,?\s*2026\s*(?:to|-|–|~|至)\s*(\d{1,2})\s*oct",
     re.I)
+# "15 - 18 October, 2026" — the day range comes before the month name.
+RANGE_RE2 = re.compile(
+    r"(\d{1,2})\s*(?:to|-|–|~|至)\s*(\d{1,2})\s*oct\w*\.?,?\s*2026", re.I)
 
 
 def is_multi_day_range(blob):
     """'7 Oct 2026 to 18 Oct 2026' is the whole tournament card, not a session."""
-    m = RANGE_RE.search(blob)
-    return bool(m and m.group(1) != m.group(2))
+    for rx in (RANGE_RE, RANGE_RE2):
+        m = rx.search(blob)
+        if m and m.group(1) != m.group(2):
+            return True
+    return False
 
 
 def has_event_keyword(blob):
@@ -436,6 +442,51 @@ class Checker:
         self.start()
 
 
+
+    def _open_day(self, page, day):
+        """Click a day cell in the calendar. The cell is a plain div, so try
+        several strategies and confirm by reading the session title back."""
+        def confirmed():
+            try:
+                body = page.inner_text("body")
+            except Exception:
+                return False
+            return (f"10/{day}" in body or f"10月{day}日" in body)
+
+        try:
+            page.get_by_text("Select a Date").first.scroll_into_view_if_needed(
+                timeout=5000)
+        except Exception:
+            pass
+
+        attempts = [
+            lambda: page.get_by_text(re.compile(rf"^\s*{day}\s*$")).first.click(
+                timeout=6000),
+            lambda: page.locator(
+                f"xpath=//*[normalize-space(text())='{day}']").last.click(
+                timeout=6000),
+            lambda: page.evaluate(
+                """(d) => {
+                    const hit = [...document.querySelectorAll('div,span,td,li,p')]
+                      .filter(e => e.textContent.trim() === d
+                                && e.children.length === 0
+                                && e.offsetParent !== null);
+                    if (!hit.length) return false;
+                    hit[hit.length - 1].click();
+                    return true;
+                }""", day),
+        ]
+        for n, attempt in enumerate(attempts, 1):
+            try:
+                attempt()
+                page.wait_for_timeout(4000)
+                if confirmed():
+                    log(f"booking: {day} Oct opened (strategy {n})")
+                    return True
+            except Exception:
+                continue
+        return confirmed()
+
     def fetch_booking(self, url):
         """Open the booking page and read each target day of the calendar."""
         context = self.browser.new_context(
@@ -467,13 +518,13 @@ class Checker:
             page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
             page.wait_for_timeout(6000)
             for day, key in BOOKING_DAYS:
-                try:
-                    page.get_by_text(day, exact=True).first.click(timeout=10000)
-                    page.wait_for_timeout(4000)
+                if self._open_day(page, day):
                     day_texts[key] = page.inner_text("body")
-                    log(f"booking: read {day} Oct ({len(day_texts[key])} chars)")
-                except Exception as e:
-                    log(f"booking: cannot open {day} Oct — {e!r}")
+                    log(f"booking: read {day} Oct "
+                        f"({len(day_texts[key])} chars)")
+                else:
+                    log(f"booking: could not select {day} Oct")
+                    self.last_html = page.content()[:200000]
         finally:
             try:
                 context.close()
@@ -1016,6 +1067,7 @@ def check_site(checker, site, state, forced=False):
             "site": site,
             "endpoints": checker.last_endpoints,
             "page_text": text[:8000],
+            "html_when_stuck": getattr(checker, "last_html", "")[:60000],
             "report": {
                 k: {"available": v["available"],
                     "offers": [{kk: vv for kk, vv in o.items() if kk != "raw"}
