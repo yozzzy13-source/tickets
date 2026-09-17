@@ -722,6 +722,82 @@ class Checker:
 
 
 
+
+# --------------------------------------------------------------------------
+# Juss public API — the real source of truth, no login needed
+# --------------------------------------------------------------------------
+# The shop's own page calls these two endpoints before any login:
+#   .../show/pub/v3/show/<showId>/sessions_static_data   -> names + dates
+#   .../show/pub/v3/show/<showId>/sessions_dynamic_data  -> live sale status
+# A session is sold out while sessionStatus == "LACK_OF_TICKET"; a restock
+# flips it to "ON_SALE".
+
+JUSS_API = ("https://ztmen.jussyun.com/cyy_gatewayapi/show/pub/v3/show/"
+            "{show_id}/sessions_{kind}_data")
+JUSS_SESSION_PATTERNS = {
+    "semifinal": [r"10月17日", r"10/17"],
+    "final": [r"10月18日", r"10/18"],
+}
+ON_SALE_STATUSES = {"ON_SALE", "PRE_SALE", "SELLING"}
+
+
+def juss_show_id(url):
+    m = re.search(r"/(?:content|booking)/([0-9a-z]+)", url)
+    return m.group(1) if m else None
+
+
+def fetch_juss_api(show_id):
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                       "Version/17.5 Mobile/15E148 Safari/604.1"),
+        "Accept": "application/json",
+        "Referer": f"https://ztmen.jussyun.com/content/{show_id}",
+    }
+    out = {}
+    for kind in ("static", "dynamic"):
+        r = requests.get(JUSS_API.format(show_id=show_id, kind=kind),
+                         headers=headers, timeout=25)
+        r.raise_for_status()
+        out[kind] = r.json()
+    return out
+
+
+def analyse_juss_api(payload):
+    static_sessions = (payload["static"].get("data") or {}).get("sessionVOs", [])
+    dyn_sessions = (payload["dynamic"].get("data") or {}).get("sessionVOs", [])
+    dyn_by_id = {d.get("bizShowSessionId"): d for d in dyn_sessions}
+
+    result = {}
+    for target in TARGETS:
+        key = target["key"]
+        pats = JUSS_SESSION_PATTERNS[key]
+        info = {"label": target["label"], "offers": [], "matched": [],
+                "available": False, "text_hint": None, "from_text": False,
+                "low_confidence": False, "sold_out_note": "сессия не найдена"}
+        for sess in static_sessions:
+            name = sess.get("sessionName", "")
+            if not any(re.search(p, name) for p in pats):
+                continue
+            dyn = dyn_by_id.get(sess.get("bizShowSessionId"), {})
+            status = dyn.get("sessionStatus", "UNKNOWN")
+            sold_out = dyn.get("hasSessionSoldOut", True)
+            on_sale = (status in ON_SALE_STATUSES) and not sold_out
+            info["session_name"] = name
+            info["status"] = status
+            info["available"] = on_sale
+            info["buy_url"] = (
+                f"https://ztmen.jussyun.com/booking/{sess.get('showId')}"
+                "?from=content&isFree=false")
+            info["sold_out_note"] = (
+                None if on_sale else
+                ("распродано (ждём дозаброса)" if status == "LACK_OF_TICKET"
+                 else f"статус {status}"))
+            break
+        result[key] = info
+    return result
+
+
 # --------------------------------------------------------------------------
 # Juss booking page: calendar -> session -> category tiles
 # --------------------------------------------------------------------------
@@ -822,6 +898,18 @@ def build_alert(site, tkey, info, max_usd, qty):
     over = [o for o in info["matched"] if (o["price_usd"] or 1e9) > max_usd]
     enough = [o for o in in_budget if o["stock"] is None or o["stock"] >= qty]
     date = SESSION_DATE.get(tkey, "")
+
+    if info.get("status") and not info["matched"]:
+        # Juss API: session-level signal, prices live behind the seat picker.
+        buy = info.get("buy_url") or site["url"]
+        return ("🎾🚨 <b>БИЛЕТЫ ВЫБРОСИЛИ — СЕССИЯ ОТКРЫЛАСЬ</b>\n"
+                f"{info['label']} · {date}\n"
+                f"{info.get('session_name', '')}\n\n"
+                f"Статус сменился на <b>{info.get('status')}</b>.\n"
+                f"Категории S / A+ / A / B, официально ¥920–1920 "
+                f"(≈${920 / CNY_PER_USD:.0f}–{1920 / CNY_PER_USD:.0f}).\n"
+                f"Нужно {qty} билета — бери сразу, разберут за минуты.\n\n"
+                f"👉 <a href=\"{buy}\">Открыть бронирование</a>")
 
     if info.get("low_confidence"):
         # We saw something that looks available but could not read prices.
@@ -1000,7 +1088,16 @@ def check_site(checker, site, state, forced=False):
     key_prefix = site["label"]
     checker.last_html = ""      # never let one site's dump leak into another
     try:
-        if is_booking_page(site["url"]):
+        show_id = (juss_show_id(site["url"])
+                   if "jussyun.com" in site["url"] else None)
+        if show_id:
+            payload = fetch_juss_api(show_id)
+            text = json.dumps(payload, ensure_ascii=False)[:20000]
+            checker.last_endpoints = [
+                JUSS_API.format(show_id=show_id, kind=k)
+                for k in ("static", "dynamic")]
+            report = analyse_juss_api(payload)
+        elif is_booking_page(site["url"]):
             day_texts, payloads = checker.fetch_booking(site["url"])
             text = checker.last_text
             report = analyse_booking(day_texts)
