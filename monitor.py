@@ -31,6 +31,31 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 TICKET_URL = os.environ.get("TICKET_URL", "https://ztmen.jussyun.com/").strip()
 
+
+def parse_sites(raw, group):
+    """'Label|https://a,Label2|https://b' -> [{'label','url','group'}]"""
+    sites = []
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "|" in chunk:
+            label, url = chunk.split("|", 1)
+        else:
+            label, url = chunk, chunk
+        label, url = label.strip(), url.strip()
+        if not url.startswith("http"):
+            continue
+        sites.append({"label": label or url, "url": url, "group": group})
+    return sites
+
+
+SITES = (parse_sites(os.environ.get("MONITOR_URLS_FAST"), "fast")
+         + parse_sites(os.environ.get("MONITOR_URLS_SLOW"), "slow"))
+if not SITES:                       # fallback to the old single-URL setup
+    SITES = [{"label": "Juss EN Shop", "url": TICKET_URL, "group": "fast"}]
+
+
 # Price ceiling per single ticket, in USD.
 MAX_PRICE_USD = float(os.environ.get("MAX_PRICE_USD", "300"))
 # "Optimal" price — anything at or below this gets the loud alert wording.
@@ -42,6 +67,7 @@ CNY_PER_USD = float(os.environ.get("CNY_PER_USD", "7.1"))
 TARGET_QTY = int(os.environ.get("TARGET_QTY", "2"))
 
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "90"))
+SLOW_INTERVAL = int(os.environ.get("SLOW_INTERVAL_SECONDS", "600"))
 # Slow down between 02:00 and 08:00 Shanghai time (nothing drops at night).
 QUIET_HOURS_MULTIPLIER = float(os.environ.get("QUIET_HOURS_MULTIPLIER", "3"))
 
@@ -316,8 +342,8 @@ class Checker:
         self.stop()
         self.start()
 
-    def fetch(self):
-        """Load the shop, harvest every XHR JSON payload and the page text."""
+    def fetch(self, url):
+        """Load a shop page, harvest its XHR JSON payloads and visible text."""
         context = self.browser.new_context(
             locale="en-US",
             timezone_id="Asia/Shanghai",
@@ -349,7 +375,7 @@ class Checker:
 
         text = ""
         try:
-            page.goto(TICKET_URL, wait_until="domcontentloaded",
+            page.goto(url, wait_until="domcontentloaded",
                       timeout=PAGE_TIMEOUT_MS)
             page.wait_for_timeout(6000)
             # Nudge lazy lists into loading.
@@ -364,6 +390,7 @@ class Checker:
                 pass
 
         self.last_endpoints = sorted(set(endpoints))[:40]
+        self.last_text = text
         return text, payloads
 
     def analyse(self, text, payloads):
@@ -439,14 +466,14 @@ def fmt_offer(o, max_usd):
             f"(≈${price_usd:.0f}){stock}")
 
 
-def build_alert(label, info, max_usd, qty):
+def build_alert(site, label, info, max_usd, qty):
     in_budget = [o for o in info["matched"] if (o["price_usd"] or 1e9) <= max_usd]
     over = [o for o in info["matched"] if (o["price_usd"] or 1e9) > max_usd]
     enough = [o for o in in_budget
               if o["stock"] is None or o["stock"] >= qty]
 
     head = "🎾🚨 <b>ЕСТЬ БИЛЕТЫ</b>" if in_budget else "🎾 <b>Появились билеты (дороже потолка)</b>"
-    lines = [f"{head}\n<b>{label}</b>", ""]
+    lines = [f"{head}\n<b>{label}</b>\nПлощадка: {site['label']}", ""]
 
     if in_budget:
         lines.append(f"В бюджете (до ${max_usd:.0f}):")
@@ -462,7 +489,10 @@ def build_alert(label, info, max_usd, qty):
         lines.append("Страница показывает доступность, но цены распарсить не вышло:")
         lines.append(f"<code>{info['text_hint']}</code>")
 
-    lines.append(f"\n👉 <a href=\"{TICKET_URL}\">Открыть магазин и купить</a>")
+    lines.append(f"\n👉 <a href=\"{site['url']}\">Открыть {site['label']}</a>")
+    if site["group"] == "slow":
+        lines.append("⚠️ Это перепродажа. Вход по паспорту покупателя — "
+                     "билет на чужое имя рискуешь не отбить на воротах.")
     lines.append("Покупай сам, руками — бот только сигналит.")
     return "\n".join(lines)
 
@@ -475,7 +505,7 @@ HELP_TEXT = """<b>Shanghai Masters 2026 — монитор билетов</b>
 
 /status — жив ли бот, сколько проверок, текущие настройки
 /check — проверить прямо сейчас, не дожидаясь цикла
-/last — что было видно на последней проверке
+/last — что было видно на последней проверке\n/sites — список площадок и статус по каждой
 /price 300 — поменять потолок цены в долларах
 /qty 2 — сколько билетов нужно
 /snapshot — прислать сырой дамп страницы и найденных запросов (для отладки)
@@ -528,13 +558,25 @@ def handle_command(text, state, chat):
             f"✅ Работаю.\nПроверок: {state['checks']} (ошибок {state['errors']})\n"
             f"Последняя удачная: {last}\n"
             f"Потолок: ${state['max_price_usd']:.0f} | нужно билетов: {TARGET_QTY}\n"
-            f"Интервал: {CHECK_INTERVAL} сек\n"
+            f"Площадок: {len(SITES)} | интервал {CHECK_INTERVAL}/{SLOW_INTERVAL} сек\n"
             f"Пауза: {'да' if state['paused'] else 'нет'}", chat)
     elif cmd == "/check":
         _commands["force_check"] = True
         tg_send("Проверяю прямо сейчас...", chat)
     elif cmd == "/last":
-        tg_send(state.get("last_report") or "Ещё не было ни одной проверки.", chat)
+        reps = list((state.get("reports") or {}).values())
+        tg_send("\n\n".join(reps) if reps
+                else "Ещё не было ни одной проверки.", chat)
+    elif cmd == "/sites":
+        lines = []
+        for s_ in SITES:
+            st = (state.get("per_site") or {}).get(s_["label"], {})
+            mark = "✅" if st.get("ok") else ("❌" if st else "…")
+            tail = f" — {st.get('err')}" if st and not st.get("ok") else ""
+            lines.append(f"{mark} <b>{s_['label']}</b> "
+                         f"({'часто' if s_['group'] == 'fast' else 'редко'})"
+                         f" {st.get('ts', '')}{tail}")
+        tg_send("\n".join(lines), chat)
     elif cmd == "/snapshot":
         _commands["want_snapshot"] = True
         _commands["force_check"] = True
@@ -589,6 +631,91 @@ def heartbeat(state):
     save_state(state)
 
 
+def check_site(checker, site, state, forced=False):
+    """Run one site, compare with last state, alert on changes."""
+    key_prefix = site["label"]
+    try:
+        text, payloads = checker.fetch(site["url"])
+        report = checker.analyse(text, payloads)
+        state["checks"] += 1
+        state["last_ok"] = datetime.now(SHANGHAI).strftime("%d.%m %H:%M")
+        state.setdefault("per_site", {})[key_prefix] = {
+            "ts": state["last_ok"], "ok": True}
+        checker.consecutive_errors = 0
+    except Exception as e:
+        state["errors"] += 1
+        checker.consecutive_errors = getattr(checker, "consecutive_errors", 0) + 1
+        state.setdefault("per_site", {})[key_prefix] = {
+            "ts": datetime.now(SHANGHAI).strftime("%d.%m %H:%M"),
+            "ok": False, "err": str(e)[:120]}
+        log(f"[{key_prefix}] check failed: {e!r}")
+        if checker.consecutive_errors in (6, 30, 90):
+            tg_send(f"⚠️ {checker.consecutive_errors} проверок подряд с ошибкой "
+                    f"(последняя — {key_prefix}):\n<code>{str(e)[:300]}</code>")
+        if checker.consecutive_errors % 6 == 0:
+            checker.restart()
+        save_state(state)
+        return
+
+    summary = []
+    for tkey, info in report.items():
+        n = len(info["matched"])
+        cheapest = min((o["price_usd"] for o in info["matched"] if o["price_usd"]),
+                       default=None)
+        summary.append(
+            f"{info['label']}: "
+            + (f"{n} вар., от ${cheapest:.0f}" if n and cheapest else
+               ("признаки наличия" if info["available"] else "нет")))
+    log(f"[{key_prefix}] " + " | ".join(summary))
+    state.setdefault("reports", {})[key_prefix] = (
+        f"<b>{key_prefix}</b> ({state['last_ok']})\n" + "\n".join(summary))
+
+    for tkey, info in report.items():
+        key = f"{key_prefix}::{tkey}"
+        prev = state["available"].get(key) or {}
+        if isinstance(prev, bool):
+            prev = {"any": prev, "budget": []}
+        budget_sigs = sorted(
+            f"{o['name']}|{o['price_cny']:.0f}"
+            for o in info["matched"]
+            if (o["price_usd"] or 1e9) <= state["max_price_usd"]
+        )
+        new_budget = [x for x in budget_sigs if x not in prev.get("budget", [])]
+        was = prev.get("any", False) and not new_budget
+        now = info["available"]
+        if now and not was:
+            tg_send(build_alert(site, info["label"], info,
+                                state["max_price_usd"], TARGET_QTY))
+            state["last_alert_ts"][key] = time.time()
+        elif now and was:
+            last = state["last_alert_ts"].get(key, 0)
+            if time.time() - last > 3600:
+                tg_send("🔁 Всё ещё в продаже:\n\n" +
+                        build_alert(site, info["label"], info,
+                                    state["max_price_usd"], TARGET_QTY),
+                        silent=True)
+                state["last_alert_ts"][key] = time.time()
+        state["available"][key] = {"any": now, "budget": budget_sigs}
+
+    if _commands["want_snapshot"]:
+        dump = {
+            "site": site,
+            "endpoints": checker.last_endpoints,
+            "page_text": text[:8000],
+            "report": {
+                k: {"available": v["available"],
+                    "offers": [{kk: vv for kk, vv in o.items() if kk != "raw"}
+                               for o in v["offers"][:20]]}
+                for k, v in report.items()},
+        }
+        tg_send_document(
+            f"snapshot-{re.sub(r'[^a-zA-Z0-9]+', '-', key_prefix)}.json",
+            json.dumps(dump, ensure_ascii=False, indent=2),
+            f"Дамп: {key_prefix}")
+
+    save_state(state)
+
+
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         log("FATAL: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
@@ -597,109 +724,48 @@ def main():
     state = load_state()
     threading.Thread(target=command_loop, args=(state,), daemon=True).start()
 
+    fast = [s_["label"] for s_ in SITES if s_["group"] == "fast"]
+    slow = [s_["label"] for s_ in SITES if s_["group"] == "slow"]
     tg_send(
         "🎾 Монитор Shanghai Masters 2026 запущен.\n"
-        f"Слежу за полуфиналом (17.10) и финалом (18.10), "
-        f"потолок ${state['max_price_usd']:.0f}, нужно {TARGET_QTY} билета.\n"
+        f"Полуфинал (17.10) и финал (18.10), потолок "
+        f"${state['max_price_usd']:.0f}, нужно {TARGET_QTY} билета.\n\n"
+        f"Часто ({CHECK_INTERVAL} сек): {', '.join(fast) or '—'}\n"
+        f"Редко ({SLOW_INTERVAL} сек): {', '.join(slow) or '—'}\n\n"
         "/help — список команд.")
 
     checker = Checker()
     checker.start()
     consecutive_errors = 0
 
+    site_due = {s["url"]: 0.0 for s in SITES}
+
     try:
         while True:
             if state["paused"] and not _commands["force_check"]:
-                time.sleep(10)
+                time.sleep(5)
                 continue
+            forced = _commands["force_check"]
             _commands["force_check"] = False
 
-            try:
-                text, payloads = checker.fetch()
-                report = checker.analyse(text, payloads)
-                state["checks"] += 1
-                state["last_ok"] = datetime.now(SHANGHAI).strftime("%d.%m %H:%M")
-                consecutive_errors = 0
+            due = [s for s in SITES
+                   if forced or time.time() >= site_due[s["url"]]]
+            if not due:
+                time.sleep(5)
+                continue
 
-                summary_lines = []
-                for key, info in report.items():
-                    n = len(info["matched"])
-                    cheapest = min(
-                        (o["price_usd"] for o in info["matched"] if o["price_usd"]),
-                        default=None)
-                    summary_lines.append(
-                        f"{info['label']}: "
-                        + (f"{n} вариантов, от ${cheapest:.0f}"
-                           if n and cheapest else
-                           ("есть признаки наличия" if info["available"]
-                            else "нет билетов")))
-                state["last_report"] = ("Последняя проверка "
-                                        f"{state['last_ok']}\n"
-                                        + "\n".join(summary_lines))
-                log(" | ".join(summary_lines))
+            for site in due:
+                gap = (interval_now() if site["group"] == "fast"
+                       else SLOW_INTERVAL)
+                site_due[site["url"]] = time.time() + gap
+                check_site(checker, site, state, forced)
 
-                for key, info in report.items():
-                    prev = state["available"].get(key) or {}
-                    if isinstance(prev, bool):      # migrate old state format
-                        prev = {"any": prev, "budget": []}
-                    budget_sigs = sorted(
-                        f"{o['name']}|{o['price_cny']:.0f}"
-                        for o in info["matched"]
-                        if (o["price_usd"] or 1e9) <= state["max_price_usd"]
-                    )
-                    new_budget = [s for s in budget_sigs
-                                  if s not in prev.get("budget", [])]
-                    was = prev.get("any", False) and not new_budget
-                    now = info["available"]
-                    info_state = {"any": now, "budget": budget_sigs}
-                    if now and not was:
-                        tg_send(build_alert(info["label"], info,
-                                            state["max_price_usd"], TARGET_QTY))
-                        state["last_alert_ts"][key] = time.time()
-                    elif now and was:
-                        # still available — remind once an hour, quietly
-                        last = state["last_alert_ts"].get(key, 0)
-                        if time.time() - last > 3600:
-                            tg_send("🔁 Всё ещё в продаже:\n\n" +
-                                    build_alert(info["label"], info,
-                                                state["max_price_usd"],
-                                                TARGET_QTY), silent=True)
-                            state["last_alert_ts"][key] = time.time()
-                    state["available"][key] = info_state
+            if _commands["want_snapshot"]:
+                _commands["want_snapshot"] = False
 
-                if _commands["want_snapshot"]:
-                    _commands["want_snapshot"] = False
-                    dump = {
-                        "endpoints": checker.last_endpoints,
-                        "page_text": text[:8000],
-                        "report": {
-                            k: {"available": v["available"],
-                                "offers": [
-                                    {kk: vv for kk, vv in o.items() if kk != "raw"}
-                                    for o in v["offers"][:20]]}
-                            for k, v in report.items()},
-                    }
-                    tg_send_document(
-                        "snapshot.json",
-                        json.dumps(dump, ensure_ascii=False, indent=2),
-                        "Дамп: какие запросы делает сайт и что распарсилось.")
-
-                heartbeat(state)
-                save_state(state)
-
-            except Exception as e:
-                state["errors"] += 1
-                consecutive_errors += 1
-                log("check failed: " + repr(e))
-                traceback.print_exc()
-                if consecutive_errors in (5, 20, 60):
-                    tg_send(f"⚠️ {consecutive_errors} проверок подряд с ошибкой: "
-                            f"<code>{str(e)[:300]}</code>")
-                if consecutive_errors % 5 == 0:
-                    checker.restart()
-                save_state(state)
-
-            time.sleep(interval_now())
+            heartbeat(state)
+            save_state(state)
+            time.sleep(3)
     finally:
         checker.stop()
 
