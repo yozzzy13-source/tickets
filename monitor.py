@@ -77,6 +77,40 @@ PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "45000"))
 
 SHANGHAI = timezone(timedelta(hours=8))
 
+# Nothing counts unless it clearly belongs to THIS tournament. The shop's
+# landing page lists concerts and other events with overlapping dates.
+EVENT_KEYWORDS = [
+    "shanghai masters", "rolex shanghai", "上海大师赛", "劳力士大师赛",
+    "qi zhong", "qizhong", "旗忠",
+]
+# Text that means "this is some other event on the same dates".
+EVENT_BLOCKLIST = [
+    "tomorrowland", "music festival", "concert", "演唱会", "音乐节",
+    "planaxis", "dome",
+]
+# Sessions we do NOT want even though they are Shanghai Masters.
+SESSION_BLOCKLIST = ["qualifying", "资格赛", "carnival", "嘉年华", "museum"]
+
+
+RANGE_RE = re.compile(
+    r"(\d{1,2})\s*oct\w*\.?\s*,?\s*2026\s*(?:to|-|–|~|至)\s*(\d{1,2})\s*oct",
+    re.I)
+
+
+def is_multi_day_range(blob):
+    """'7 Oct 2026 to 18 Oct 2026' is the whole tournament card, not a session."""
+    m = RANGE_RE.search(blob)
+    return bool(m and m.group(1) != m.group(2))
+
+
+def mentions_event(blob):
+    low = blob.lower()
+    if not any(k in low for k in EVENT_KEYWORDS):
+        return False
+    if any(b in low for b in EVENT_BLOCKLIST):
+        return False
+    return True
+
 # Sessions we care about. Tournament runs 5-18 Oct 2026:
 # semi-finals Sat 17 Oct, final Sun 18 Oct.
 TARGETS = [
@@ -84,17 +118,20 @@ TARGETS = [
         "key": "semifinal",
         "label": "ПОЛУФИНАЛ (17 окт, сб)",
         "patterns": [
-            r"10[-/.月]?17", r"17[-/.]10", r"oct\w*\.?\s*17", r"17\s*oct",
-            r"2026-10-17", r"semi[- ]?final", r"半决赛",
+            r"2026[-/.]10[-/.]17", r"10[-/.月]17", r"17\s*oct\w*\s*2026",
+            r"oct\w*\.?\s*17,?\s*2026", r"semi[- ]?final", r"半决赛",
         ],
     },
     {
         "key": "final",
         "label": "ФИНАЛ (18 окт, вс)",
         "patterns": [
-            r"10[-/.月]?18", r"18[-/.]10", r"oct\w*\.?\s*18", r"18\s*oct",
-            r"2026-10-18", r"\bfinal\b", r"决赛",
+            r"2026[-/.]10[-/.]18", r"10[-/.月]18", r"18\s*oct\w*\s*2026",
+            r"oct\w*\.?\s*18,?\s*2026", r"\bfinals?\b", r"决赛",
         ],
+        # "Semi-Finals" also contains "final" — never let it count here.
+        "reject": [r"semi[- ]?final", r"quarter[- ]?final", r"半决赛",
+                   r"2026[-/.]10[-/.]17", r"10[-/.月]17"],
     },
 ]
 
@@ -204,6 +241,8 @@ def save_state(state):
 
 def matches_target(blob, target):
     low = blob.lower()
+    if any(re.search(p, low) for p in target.get("reject", [])):
+        return False
     return any(re.search(p, low) for p in target["patterns"])
 
 
@@ -378,6 +417,20 @@ class Checker:
             page.goto(url, wait_until="domcontentloaded",
                       timeout=PAGE_TIMEOUT_MS)
             page.wait_for_timeout(6000)
+
+            # The landing page is a list of every event the shop sells
+            # (concerts included). Step into the tournament itself.
+            for hint in ("Center Court", "SHANGHAI MASTERS", "上海大师赛"):
+                try:
+                    loc = page.get_by_text(hint, exact=False).first
+                    if loc.count() == 0:
+                        continue
+                    loc.click(timeout=8000)
+                    page.wait_for_timeout(6000)
+                    log(f"Stepped into '{hint}'")
+                    break
+                except Exception:
+                    continue
             # Nudge lazy lists into loading.
             for _ in range(4):
                 page.mouse.wheel(0, 1600)
@@ -406,6 +459,13 @@ class Checker:
                 if not isinstance(d, dict) or not dict_looks_like_ticket(d):
                     continue
                 blob = json.dumps(d, ensure_ascii=False) + " " + ctx
+                if not mentions_event(blob):
+                    continue
+                low = blob.lower()
+                if any(b in low for b in SESSION_BLOCKLIST):
+                    continue
+                if is_multi_day_range(blob):
+                    continue
                 if not matches_target(blob, target):
                     continue
                 offer = describe_offer(d)
@@ -431,16 +491,24 @@ class Checker:
             if not uniq and text:
                 low_all = text.lower()
                 for pat in target["patterns"]:
-                    m = re.search(pat, low_all)
-                    if not m:
-                        continue
-                    start = max(0, low_all.rfind("\n\n", 0, m.start()) + 1)
-                    nxt = low_all.find("\n\n", m.end())
-                    end = nxt if 0 < nxt < m.end() + 600 else m.end() + 400
-                    window = low_all[start:end]
-                    if any(w in window for w in AVAILABLE_WORDS) and \
-                       not any(w in window for w in SOLD_OUT_WORDS):
-                        text_hint = text[start:end].strip()[:400]
+                    for m in re.finditer(pat, low_all):
+                        start = max(0, low_all.rfind("\n\n", 0, m.start()) + 1)
+                        nxt = low_all.find("\n\n", m.end())
+                        end = nxt if 0 < nxt < m.end() + 500 else m.end() + 300
+                        window = low_all[start:end]
+                        if not mentions_event(window):
+                            continue
+                        if any(b in window for b in SESSION_BLOCKLIST):
+                            continue
+                        if is_multi_day_range(window):
+                            continue
+                        if any(w in window for w in AVAILABLE_WORDS) and \
+                           not any(w in window for w in SOLD_OUT_WORDS):
+                            text_hint = " / ".join(
+                                ln.strip() for ln in text[start:end].splitlines()
+                                if ln.strip())[:180]
+                            break
+                    if text_hint:
                         break
 
             result[target["key"]] = {
@@ -449,6 +517,7 @@ class Checker:
                 "available": bool(available) or bool(text_hint),
                 "matched": available,
                 "text_hint": text_hint,
+                "low_confidence": not available and bool(text_hint),
             }
         return result
 
@@ -457,43 +526,57 @@ class Checker:
 # Alerting
 # --------------------------------------------------------------------------
 
+SESSION_DATE = {
+    "semifinal": "сб 17 октября 2026",
+    "final": "вс 18 октября 2026",
+}
+
+
 def fmt_offer(o, max_usd):
     price_usd = o["price_usd"] or 0
     tag = "🟢" if price_usd <= GOOD_PRICE_USD else (
         "🟡" if price_usd <= max_usd else "⚪️")
-    stock = f", осталось ~{o['stock']}" if o["stock"] is not None else ""
-    return (f"{tag} <b>{o['name']}</b> — ¥{o['price_cny']:.0f} "
-            f"(≈${price_usd:.0f}){stock}")
+    stock = f" · {o['stock']} шт" if o["stock"] is not None else ""
+    return (f"{tag} {o['name']} — <b>${price_usd:.0f}</b> "
+            f"(¥{o['price_cny']:.0f}){stock}")
 
 
-def build_alert(site, label, info, max_usd, qty):
+def build_alert(site, tkey, info, max_usd, qty):
+    """Short, scannable message: what, when, how much, where."""
     in_budget = [o for o in info["matched"] if (o["price_usd"] or 1e9) <= max_usd]
     over = [o for o in info["matched"] if (o["price_usd"] or 1e9) > max_usd]
-    enough = [o for o in in_budget
-              if o["stock"] is None or o["stock"] >= qty]
+    enough = [o for o in in_budget if o["stock"] is None or o["stock"] >= qty]
+    date = SESSION_DATE.get(tkey, "")
 
-    head = "🎾🚨 <b>ЕСТЬ БИЛЕТЫ</b>" if in_budget else "🎾 <b>Появились билеты (дороже потолка)</b>"
-    lines = [f"{head}\n<b>{label}</b>\nПлощадка: {site['label']}", ""]
+    if info.get("low_confidence"):
+        # We saw something that looks available but could not read prices.
+        return ("🔎 <b>ВОЗМОЖНО ЕСТЬ — нужна ручная проверка</b>\n"
+                f"{info['label']} · {date}\n"
+                f"{site['label']}\n\n"
+                "Цены прочитать не удалось, страница показывает доступность.\n"
+                f"<a href=\"{site['url']}\">Открыть и проверить</a>")
 
     if in_budget:
-        lines.append(f"В бюджете (до ${max_usd:.0f}):")
-        lines += [fmt_offer(o, max_usd) for o in in_budget[:12]]
-        if enough:
-            lines.append(f"\n✅ Хватает на {qty} билета минимум в одной категории.")
-        else:
-            lines.append(f"\n⚠️ Может не хватить на {qty} — проверь при оформлении.")
-    if over:
-        lines.append(f"\nВыше потолка:")
-        lines += [fmt_offer(o, max_usd) for o in over[:6]]
-    if not info["matched"] and info["text_hint"]:
-        lines.append("Страница показывает доступность, но цены распарсить не вышло:")
-        lines.append(f"<code>{info['text_hint']}</code>")
+        head = "🎾🚨 <b>ЕСТЬ БИЛЕТЫ В БЮДЖЕТЕ</b>"
+    else:
+        head = "🎾 <b>Есть билеты, но дороже потолка</b>"
 
-    lines.append(f"\n👉 <a href=\"{site['url']}\">Открыть {site['label']}</a>")
+    lines = [head, f"{info['label']} · {date}", f"Площадка: {site['label']}", ""]
+
+    if in_budget:
+        for o in in_budget[:8]:
+            lines.append(fmt_offer(o, max_usd))
+        lines.append("")
+        lines.append(f"✅ На {qty} билета хватает" if enough
+                     else f"⚠️ На {qty} билета может не хватить")
+    if over:
+        cheapest_over = min(o["price_usd"] or 0 for o in over)
+        lines.append(f"Выше ${max_usd:.0f}: {len(over)} вариантов, "
+                     f"дешевейший ${cheapest_over:.0f}")
+
+    lines.append(f"\n<a href=\"{site['url']}\">Купить на {site['label']}</a>")
     if site["group"] == "slow":
-        lines.append("⚠️ Это перепродажа. Вход по паспорту покупателя — "
-                     "билет на чужое имя рискуешь не отбить на воротах.")
-    lines.append("Покупай сам, руками — бот только сигналит.")
+        lines.append("⚠️ Перепродажа: вход по паспорту покупателя.")
     return "\n".join(lines)
 
 
@@ -624,9 +707,12 @@ def heartbeat(state):
     if datetime.now(SHANGHAI).hour < 9:
         return
     state["last_heartbeat_day"] = today
+    hits = sum(1 for v in state.get("available", {}).values()
+               if isinstance(v, dict) and v.get("budget"))
     tg_send(
-        f"🫀 Жив. За сутки проверок всего: {state['checks']} "
-        f"(ошибок {state['errors']}). Билетов в бюджете пока нет.",
+        f"🫀 Жив. Проверок: {state['checks']} (ошибок {state['errors']}).\n"
+        + ("Билетов в бюджете сейчас нет." if not hits
+           else f"Сейчас в продаже в бюджете: {hits} позиций — /last"),
         silent=True)
     save_state(state)
 
@@ -683,15 +769,16 @@ def check_site(checker, site, state, forced=False):
         new_budget = [x for x in budget_sigs if x not in prev.get("budget", [])]
         was = prev.get("any", False) and not new_budget
         now = info["available"]
-        if now and not was:
-            tg_send(build_alert(site, info["label"], info,
+        cooldown = 43200 if info.get("low_confidence") else 0
+        last = state["last_alert_ts"].get(key, 0)
+        if now and not was and time.time() - last >= cooldown:
+            tg_send(build_alert(site, tkey, info,
                                 state["max_price_usd"], TARGET_QTY))
             state["last_alert_ts"][key] = time.time()
-        elif now and was:
-            last = state["last_alert_ts"].get(key, 0)
+        elif now and was and not info.get("low_confidence"):
             if time.time() - last > 3600:
                 tg_send("🔁 Всё ещё в продаже:\n\n" +
-                        build_alert(site, info["label"], info,
+                        build_alert(site, tkey, info,
                                     state["max_price_usd"], TARGET_QTY),
                         silent=True)
                 state["last_alert_ts"][key] = time.time()
