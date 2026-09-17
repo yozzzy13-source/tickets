@@ -514,6 +514,7 @@ class Checker:
         page.set_default_timeout(PAGE_TIMEOUT_MS)
 
         day_texts = {}
+        self.login_wall = False
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
             page.wait_for_timeout(6000)
@@ -524,7 +525,11 @@ class Checker:
                         f"({len(day_texts[key])} chars)")
                 else:
                     log(f"booking: could not select {day} Oct")
-                    self.last_html = page.content()[:200000]
+                    html = page.content()
+                    self.last_html = html[:200000]
+                    if ("account-register-layout" in html
+                            or "Verification Code" in html):
+                        self.login_wall = True
         finally:
             try:
                 context.close()
@@ -785,7 +790,7 @@ def analyse_booking(day_texts):
             "low_confidence": False,
             "sold_out_note": (None if offers else
                               ("все категории в Replenishment" if text
-                               else "страница не открылась")),
+                               else "требуется вход в аккаунт")),
         }
     return result
 
@@ -991,6 +996,7 @@ def heartbeat(state):
 def check_site(checker, site, state, forced=False):
     """Run one site, compare with last state, alert on changes."""
     key_prefix = site["label"]
+    checker.last_html = ""      # never let one site's dump leak into another
     try:
         if is_booking_page(site["url"]):
             day_texts, payloads = checker.fetch_booking(site["url"])
