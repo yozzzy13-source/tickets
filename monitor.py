@@ -92,6 +92,12 @@ EVENT_BLOCKLIST = [
 SESSION_BLOCKLIST = ["qualifying", "资格赛", "carnival", "嘉年华", "museum"]
 
 
+# Only real dates end a session block. Words like "Final" must not, because
+# "Semi-Finals" contains one and would cut the block before its prices.
+SESSION_BOUNDARY_RE = re.compile(
+    r"\d{1,2}\s*oct\w*\.?\s*,?\s*2026|2026[-/.]10[-/.]\d{1,2}|10[-/.月]\d{1,2}",
+    re.I)
+
 RANGE_RE = re.compile(
     r"(\d{1,2})\s*oct\w*\.?\s*,?\s*2026\s*(?:to|-|–|~|至)\s*(\d{1,2})\s*oct",
     re.I)
@@ -103,13 +109,18 @@ def is_multi_day_range(blob):
     return bool(m and m.group(1) != m.group(2))
 
 
-def mentions_event(blob):
+def has_event_keyword(blob):
     low = blob.lower()
-    if not any(k in low for k in EVENT_KEYWORDS):
-        return False
-    if any(b in low for b in EVENT_BLOCKLIST):
-        return False
-    return True
+    return any(k in low for k in EVENT_KEYWORDS)
+
+
+def is_other_event(blob):
+    low = blob.lower()
+    return any(b in low for b in EVENT_BLOCKLIST)
+
+
+def mentions_event(blob):
+    return has_event_keyword(blob) and not is_other_event(blob)
 
 # Sessions we care about. Tournament runs 5-18 Oct 2026:
 # semi-finals Sat 17 Oct, final Sun 18 Oct.
@@ -138,6 +149,9 @@ TARGETS = [
 SOLD_OUT_WORDS = [
     "sold out", "soldout", "售罄", "已售罄", "无票", "缺货",
     "unavailable", "not available", "暂无", "已售完",
+    # Juss marks a sold-out category "Replenishment" (waitlist for a restock).
+    "replenishment", "补货", "候补", "缺货登记",
+    "we will inform you",
 ]
 AVAILABLE_WORDS = [
     "buy", "purchase", "book now", "select", "add to cart",
@@ -238,6 +252,46 @@ def save_state(state):
 # --------------------------------------------------------------------------
 # Parsing helpers
 # --------------------------------------------------------------------------
+
+TEXT_PRICE_RE = re.compile(
+    r"(?:(usd|us\$|\$)\s*([\d,]+(?:\.\d{2})?)"
+    r"|(cny|rmb|¥|￥)\s*([\d,]+)"
+    r"|([\d,]+)\s*(?:yuan|元))", re.I)
+
+
+def offers_from_text(window_raw):
+    """Pull 'CAT 3  Buy  USD 240'-style rows out of rendered page text."""
+    offers = []
+    for line in window_raw.splitlines():
+        m = TEXT_PRICE_RE.search(line)
+        if not m:
+            continue
+        if m.group(2):
+            usd = float(m.group(2).replace(",", ""))
+            cny = usd * CNY_PER_USD
+        else:
+            raw = (m.group(4) or m.group(5) or "").replace(",", "")
+            if not raw:
+                continue
+            cny = float(raw)
+            usd = cny / CNY_PER_USD
+        name = TEXT_PRICE_RE.sub("", line)
+        name = re.sub(r"\b(buy|book|select|purchase|from|tickets?)\b", "",
+                      name, flags=re.I)
+        name = re.sub(r"\s{2,}", " ", name).strip(" -·|,") or "категория не указана"
+        offers.append({
+            "name": name[:60], "price_cny": cny, "price_usd": usd,
+            "stock": None, "available": True,
+        })
+    # de-duplicate, cheapest first
+    seen, uniq = set(), []
+    for o in sorted(offers, key=lambda x: x["price_usd"]):
+        sig = (o["name"], round(o["price_usd"]))
+        if sig not in seen:
+            seen.add(sig)
+            uniq.append(o)
+    return uniq[:10]
+
 
 def matches_target(blob, target):
     low = blob.lower()
@@ -381,17 +435,82 @@ class Checker:
         self.stop()
         self.start()
 
-    def fetch(self, url):
-        """Load a shop page, harvest its XHR JSON payloads and visible text."""
+
+    def fetch_booking(self, url):
+        """Open the booking page and read each target day of the calendar."""
         context = self.browser.new_context(
-            locale="en-US",
-            timezone_id="Asia/Shanghai",
+            locale="en-US", timezone_id="Asia/Shanghai",
             viewport={"width": 430, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
                 "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 "
                 "Mobile/15E148 Safari/604.1"
             ),
+        )
+        payloads, endpoints = [], []
+
+        def on_response(resp):
+            try:
+                if "json" not in (resp.header_value("content-type") or "").lower():
+                    return
+                endpoints.append(resp.url.split("?")[0])
+                payloads.append({"url": resp.url, "body": resp.json()})
+            except Exception:
+                pass
+
+        page = context.new_page()
+        page.on("response", on_response)
+        page.set_default_timeout(PAGE_TIMEOUT_MS)
+
+        day_texts = {}
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+            page.wait_for_timeout(6000)
+            for day, key in BOOKING_DAYS:
+                try:
+                    page.get_by_text(day, exact=True).first.click(timeout=10000)
+                    page.wait_for_timeout(4000)
+                    day_texts[key] = page.inner_text("body")
+                    log(f"booking: read {day} Oct ({len(day_texts[key])} chars)")
+                except Exception as e:
+                    log(f"booking: cannot open {day} Oct — {e!r}")
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        self.last_endpoints = sorted(set(endpoints))[:40]
+        self.last_text = "\n\n===== ".join(
+            f"{k}\n{v}" for k, v in day_texts.items())
+        return day_texts, payloads
+
+    def fetch(self, url, mobile=True):
+        """Load a shop page, harvest its XHR JSON payloads and visible text."""
+        # The Chinese shops are mobile-first; western resale sites serve a
+        # stripped-down stub to a phone user agent, so they need desktop.
+        if mobile:
+            profile = {
+                "viewport": {"width": 430, "height": 900},
+                "user_agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 "
+                    "Mobile/15E148 Safari/604.1"
+                ),
+            }
+        else:
+            profile = {
+                "viewport": {"width": 1440, "height": 900},
+                "user_agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/128.0.0.0 Safari/537.36"
+                ),
+            }
+        context = self.browser.new_context(
+            locale="en-US",
+            timezone_id="Asia/Shanghai",
+            **profile,
         )
         payloads = []
         endpoints = []
@@ -420,7 +539,9 @@ class Checker:
 
             # The landing page is a list of every event the shop sells
             # (concerts included). Step into the tournament itself.
-            for hint in ("Center Court", "SHANGHAI MASTERS", "上海大师赛"):
+            hints = (("Center Court", "SHANGHAI MASTERS", "上海大师赛")
+                     if mobile else ())
+            for hint in hints:
                 try:
                     loc = page.get_by_text(hint, exact=False).first
                     if loc.count() == 0:
@@ -488,15 +609,31 @@ class Checker:
 
             # Fallback: nothing usable in JSON -> read the rendered text.
             text_hint = None
+            text_offers = []
             if not uniq and text:
                 low_all = text.lower()
                 for pat in target["patterns"]:
                     for m in re.finditer(pat, low_all):
-                        start = max(0, low_all.rfind("\n\n", 0, m.start()) + 1)
-                        nxt = low_all.find("\n\n", m.end())
-                        end = nxt if 0 < nxt < m.end() + 500 else m.end() + 300
+                        # Start at the beginning of the matched line...
+                        start = low_all.rfind("\n", 0, m.start()) + 1
+                        # ...and stop before the next session heading, so one
+                        # session never inherits the neighbouring one's prices.
+                        end = min(
+                            [len(low_all), m.end() + 400]
+                            + [mm.start()
+                               for mm in SESSION_BOUNDARY_RE.finditer(low_all)
+                               if mm.start() > m.end()]
+                        )
+                        blank = low_all.find("\n\n", m.end())
+                        if 0 < blank < end:
+                            end = blank
                         window = low_all[start:end]
-                        if not mentions_event(window):
+                        # The tournament name often sits in the page header,
+                        # outside the price block — accept either scope.
+                        if is_other_event(window):
+                            continue
+                        if not (has_event_keyword(window)
+                                or has_event_keyword(text)):
                             continue
                         if any(b in window for b in SESSION_BLOCKLIST):
                             continue
@@ -504,8 +641,10 @@ class Checker:
                             continue
                         if any(w in window for w in AVAILABLE_WORDS) and \
                            not any(w in window for w in SOLD_OUT_WORDS):
+                            raw_window = text[start:end]
+                            text_offers = offers_from_text(raw_window)
                             text_hint = " / ".join(
-                                ln.strip() for ln in text[start:end].splitlines()
+                                ln.strip() for ln in raw_window.splitlines()
                                 if ln.strip())[:180]
                             break
                     if text_hint:
@@ -515,11 +654,89 @@ class Checker:
                 "label": target["label"],
                 "offers": uniq,
                 "available": bool(available) or bool(text_hint),
-                "matched": available,
+                "matched": available or text_offers,
                 "text_hint": text_hint,
-                "low_confidence": not available and bool(text_hint),
+                "from_text": bool(text_offers) and not available,
+                "low_confidence": (not available and bool(text_hint)
+                                   and not text_offers),
             }
         return result
+
+
+
+# --------------------------------------------------------------------------
+# Juss booking page: calendar -> session -> category tiles
+# --------------------------------------------------------------------------
+
+BOOKING_DAYS = [("17", "semifinal"), ("18", "final")]
+CATEGORY_TOKENS = ["S", "A+", "A", "B"]
+
+
+def is_booking_page(url):
+    return "/booking/" in url
+
+
+def parse_category_tiles(text):
+    """Read the S / A+ / A / B tiles under the 'Price' heading.
+
+    A tile carrying 'Replenishment' is sold out. A tile carrying a number is
+    on sale, and that number is its price in CNY.
+    """
+    low = text.lower()
+    i = low.rfind("price")
+    seg_raw = text[i:] if i >= 0 else text
+    for stop in ("we will inform", "replenishment registered", "select seats"):
+        j = seg_raw.lower().find(stop)
+        if j > 0:
+            seg_raw = seg_raw[:j]
+            break
+
+    lines = [ln.strip() for ln in seg_raw.splitlines()]
+    offers = []
+    for idx, ln in enumerate(lines):
+        if ln not in CATEGORY_TOKENS:
+            continue
+        window = " ".join(lines[max(0, idx - 2): idx + 3]).lower()
+        if any(w in window for w in SOLD_OUT_WORDS):
+            continue
+        m = re.search(r"(?:cny|rmb|¥|￥)?\s*([\d][\d,]{1,6})", window)
+        if not m:
+            continue
+        cny = float(m.group(1).replace(",", ""))
+        if cny < 30 or cny > 20000:      # sanity: real tickets are 60-1920
+            continue
+        offers.append({
+            "name": f"Категория {ln}", "price_cny": cny,
+            "price_usd": cny / CNY_PER_USD, "stock": None, "available": True,
+        })
+    uniq, seen = [], set()
+    for o in sorted(offers, key=lambda x: x["price_cny"]):
+        if o["name"] in seen:
+            continue
+        seen.add(o["name"])
+        uniq.append(o)
+    return uniq
+
+
+def analyse_booking(day_texts):
+    result = {}
+    for target in TARGETS:
+        key = target["key"]
+        text = day_texts.get(key, "")
+        offers = parse_category_tiles(text) if text else []
+        result[key] = {
+            "label": target["label"],
+            "offers": offers,
+            "matched": offers,
+            "available": bool(offers),
+            "text_hint": None,
+            "from_text": False,
+            "low_confidence": False,
+            "sold_out_note": (None if offers else
+                              ("все категории в Replenishment" if text
+                               else "страница не открылась")),
+        }
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -571,9 +788,12 @@ def build_alert(site, tkey, info, max_usd, qty):
                      else f"⚠️ На {qty} билета может не хватить")
     if over:
         cheapest_over = min(o["price_usd"] or 0 for o in over)
-        lines.append(f"Выше ${max_usd:.0f}: {len(over)} вариантов, "
-                     f"дешевейший ${cheapest_over:.0f}")
+        word = "вариант" if len(over) == 1 else "варианта" if len(over) < 5 else "вариантов"
+        lines.append(f"Выше ${max_usd:.0f}: {len(over)} {word}, "
+                     f"от ${cheapest_over:.0f}")
 
+    if info.get("from_text"):
+        lines.append("ℹ️ Цены считаны со страницы — сверь при оформлении.")
     lines.append(f"\n<a href=\"{site['url']}\">Купить на {site['label']}</a>")
     if site["group"] == "slow":
         lines.append("⚠️ Перепродажа: вход по паспорту покупателя.")
@@ -721,8 +941,14 @@ def check_site(checker, site, state, forced=False):
     """Run one site, compare with last state, alert on changes."""
     key_prefix = site["label"]
     try:
-        text, payloads = checker.fetch(site["url"])
-        report = checker.analyse(text, payloads)
+        if is_booking_page(site["url"]):
+            day_texts, payloads = checker.fetch_booking(site["url"])
+            text = checker.last_text
+            report = analyse_booking(day_texts)
+        else:
+            text, payloads = checker.fetch(site["url"],
+                                           mobile=(site["group"] == "fast"))
+            report = checker.analyse(text, payloads)
         state["checks"] += 1
         state["last_ok"] = datetime.now(SHANGHAI).strftime("%d.%m %H:%M")
         state.setdefault("per_site", {})[key_prefix] = {
@@ -751,7 +977,8 @@ def check_site(checker, site, state, forced=False):
         summary.append(
             f"{info['label']}: "
             + (f"{n} вар., от ${cheapest:.0f}" if n and cheapest else
-               ("признаки наличия" if info["available"] else "нет")))
+               ("признаки наличия" if info["available"] else
+                info.get("sold_out_note") or "нет")))
     log(f"[{key_prefix}] " + " | ".join(summary))
     state.setdefault("reports", {})[key_prefix] = (
         f"<b>{key_prefix}</b> ({state['last_ok']})\n" + "\n".join(summary))
