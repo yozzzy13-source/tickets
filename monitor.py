@@ -135,8 +135,10 @@ TARGETS = [
         "key": "semifinal",
         "label": "ПОЛУФИНАЛ (17 окт, сб)",
         "patterns": [
+            # Dates only. Words like "Semifinals"/"Final" appear in prose,
+            # menus and other tournaments' names, and caused false alarms.
             r"2026[-/.]10[-/.]17", r"10[-/.月]17", r"17\s*oct\w*\s*2026",
-            r"oct\w*\.?\s*17,?\s*2026", r"semi[- ]?final", r"半决赛",
+            r"oct\w*\.?\s*17,?\s*2026", r"17\s*october",
         ],
     },
     {
@@ -144,7 +146,7 @@ TARGETS = [
         "label": "ФИНАЛ (18 окт, вс)",
         "patterns": [
             r"2026[-/.]10[-/.]18", r"10[-/.月]18", r"18\s*oct\w*\s*2026",
-            r"oct\w*\.?\s*18,?\s*2026", r"\bfinals?\b", r"决赛",
+            r"oct\w*\.?\s*18,?\s*2026", r"18\s*october",
         ],
         # "Semi-Finals" also contains "final" — never let it count here.
         "reject": [r"semi[- ]?final", r"quarter[- ]?final", r"半决赛",
