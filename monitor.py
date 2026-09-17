@@ -1013,9 +1013,16 @@ def handle_command(text, state, chat):
         _commands["force_check"] = True
         tg_send("Проверяю прямо сейчас...", chat)
     elif cmd == "/last":
-        reps = list((state.get("reports") or {}).values())
-        tg_send("\n\n".join(reps) if reps
-                else "Ещё не было ни одной проверки.", chat)
+        # Only sites that are configured right now — old entries in the state
+        # file are not a picture of what the bot is actually watching.
+        reports = state.get("reports") or {}
+        active = [s_["label"] for s_ in SITES]
+        reps = [reports[lbl] for lbl in active if lbl in reports]
+        pending = [lbl for lbl in active if lbl not in reports]
+        msg = "\n\n".join(reps) if reps else "Ещё не было ни одной проверки."
+        if pending:
+            msg += "\n\nЕщё не проверялись: " + ", ".join(pending)
+        tg_send(msg, chat)
     elif cmd == "/sites":
         lines = []
         for s_ in SITES:
